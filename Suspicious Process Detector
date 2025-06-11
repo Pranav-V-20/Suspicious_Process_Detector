@@ -1,0 +1,180 @@
+import psutil
+import time
+import os
+import json
+import hashlib
+import requests
+import smtplib
+from tkinter import *
+from datetime import datetime
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from threading import Thread
+
+# === Configuration ===
+LOG_FILE = "process_monitor_log.json"
+VIRUSTOTAL_API_KEY = "<YOUR_VIRUSTOTAL_API_KEY>"
+EMAIL_SENDER = "your_email@gmail.com"
+EMAIL_PASSWORD = "your_app_password"
+EMAIL_RECEIVER = "receiver_email@gmail.com"
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/your/webhook/url"
+
+SUSPICIOUS_PROCESSES = ["mimikatz", "nc", "ncat", "powershell", "cmd.exe", "wget", "curl", "netstat", "telnet", "nmap", "python", "python3"]
+SUSPICIOUS_PARENTS = {
+    "explorer.exe": ["cmd.exe", "powershell.exe"],
+    "python.exe": ["cmd.exe"],
+    "svchost.exe": ["cmd.exe", "powershell.exe"],
+    "init": ["bash", "nc", "wget", "curl"]
+}
+WHITELIST = []
+BLACKLIST = []
+
+# === Alerts ===
+def send_email_alert(subject, body):
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_SENDER
+        msg['To'] = EMAIL_RECEIVER
+        msg['Subject'] = subject
+
+        msg.attach(MIMEText(body, 'plain'))
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        text = msg.as_string()
+        server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, text)
+        server.quit()
+    except Exception as e:
+        print(f"[!] Email alert failed: {e}")
+
+def send_discord_alert(message):
+    try:
+        payload = {"content": message}
+        requests.post(DISCORD_WEBHOOK_URL, json=payload)
+    except Exception as e:
+        print(f"[!] Discord alert failed: {e}")
+
+# === Utility ===
+def log_event(event):
+    event['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_FILE, "a") as f:
+        f.write(json.dumps(event) + "\n")
+
+    message = f"{event['event']} - {event.get('description', '')} (PID: {event.get('pid')})"
+    send_discord_alert(message)
+    send_email_alert(event['event'], message)
+
+def hash_file(path):
+    try:
+        with open(path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except:
+        return None
+
+def virustotal_lookup(file_hash):
+    url = f"https://www.virustotal.com/api/v3/files/{file_hash}"
+    headers = {"x-apikey": VIRUSTOTAL_API_KEY}
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        result = response.json()
+        positives = result['data']['attributes']['last_analysis_stats']['malicious']
+        return positives > 0
+    return False
+
+# === Detection Logic ===
+def check_process(proc):
+    try:
+        name = proc.name().lower()
+        pid = proc.pid
+        ppid = proc.ppid()
+        parent_name = psutil.Process(ppid).name().lower() if psutil.pid_exists(ppid) else "unknown"
+        exe = proc.exe()
+
+        if name in WHITELIST:
+            return
+
+        file_hash = hash_file(exe)
+        vt_flag = virustotal_lookup(file_hash) if file_hash else False
+
+        if name in BLACKLIST or name in SUSPICIOUS_PROCESSES or vt_flag:
+            log_event({
+                "event": "SUSPICIOUS_PROCESS",
+                "process": name,
+                "pid": pid,
+                "ppid": ppid,
+                "parent": parent_name,
+                "description": f"Malicious or suspicious tool '{name}' detected."
+            })
+
+        if parent_name in SUSPICIOUS_PARENTS and name in SUSPICIOUS_PARENTS[parent_name]:
+            log_event({
+                "event": "SUSPICIOUS_PARENT_CHILD",
+                "process": name,
+                "pid": pid,
+                "ppid": ppid,
+                "parent": parent_name,
+                "description": f"Suspicious relationship: {parent_name} -> {name}"
+            })
+
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+
+# === GUI ===
+def launch_gui():
+    window = Tk()
+    window.title("Suspicious Process Detector")
+    window.geometry("600x300")
+
+    label = Label(window, text="Monitoring Processes...", font=("Arial", 16))
+    label.pack(pady=20)
+
+    log_box = Text(window, height=10, width=70)
+    log_box.pack()
+
+    def update_log_box():
+        try:
+            with open(LOG_FILE, "r") as f:
+                lines = f.readlines()
+                log_box.delete(1.0, END)
+                log_box.insert(END, "".join(lines[-10:]))
+        except:
+            pass
+        window.after(2000, update_log_box)
+
+    update_log_box()
+    window.mainloop()
+
+# === Monitor Thread ===
+def monitor_processes():
+    existing_pids = set(p.pid for p in psutil.process_iter())
+    while True:
+        try:
+            current_pids = set(p.pid for p in psutil.process_iter())
+            new_pids = current_pids - existing_pids
+            stopped_pids = existing_pids - current_pids
+
+            for pid in new_pids:
+                try:
+                    proc = psutil.Process(pid)
+                    check_process(proc)
+                except psutil.NoSuchProcess:
+                    continue
+
+            for pid in stopped_pids:
+                log_event({
+                    "event": "PROCESS_STOP",
+                    "pid": pid,
+                    "description": "Process stopped"
+                })
+
+            existing_pids = current_pids
+            time.sleep(3)
+
+        except KeyboardInterrupt:
+            print("\n[!] Exiting monitor.")
+            break
+
+# === Main ===
+if __name__ == "__main__":
+    Thread(target=monitor_processes, daemon=True).start()
+    launch_gui()
