@@ -1,7 +1,3 @@
-Here’s a complete and professional **GitHub README** for your **Suspicious Process Detector** project:
-
----
-
 # 🕵️‍♂️ Suspicious Process Detector
 
 A cross-platform (Windows/Linux) real-time process monitoring tool that detects suspicious or malicious process activities based on:
